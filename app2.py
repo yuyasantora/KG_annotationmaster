@@ -24,13 +24,15 @@ import re
 from dotenv import load_dotenv
 import boto3
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import Column, Integer, String, JSON
+from sqlalchemy import Column, Integer, String, JSON, DateTime, ForeignKey
 from sqlalchemy import func, text, or_
 from sqlalchemy.dialects.postgresql import JSONB
 from sentence_transformers import SentenceTransformer
 import faiss
+import hashlib
+from passlib.context import CryptContext
 
 
 load_dotenv()
@@ -71,16 +73,30 @@ class Image(Base):
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String, unique=True, index=True)
     s3_key = Column(String, unique=True)
+    # ハッシュ値を記録するカラム
+    image_hash = Column(String, unique=True, nullable=True)
     label = Column(String, nullable=True)
     annotations = Column(JSONB, nullable=True)
     width = Column(Integer, nullable=True)
     height = Column(Integer, nullable=True)
     vector = Column(JSONB, nullable=True)
 
+# ユーザーデータを格納するテーブルモデル
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
+
+# アノテーションログを格納するテーブルモデル
+class AnnotationLog(Base):
+    __tablename__ = 'annotation_logs'
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    image_id = Column(Integer, ForeignKey('images.id'), nullable=False)
+    annotation = Column(JSONB, nullable=False)
+    created_at = Column(DateTime, default=func.now())
 # --- データベース接続設定 ---
-# 元のSQLite接続設定
-# DATABASE_FILE = "annotation.db"
-# engine = create_engine(f"sqlite:///{DATABASE_FILE}")
 
 # 新しいPostgreSQLへの接続設定
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -95,6 +111,30 @@ engine = create_engine(DATABASE_URL)
 Base.metadata.create_all(engine)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# パスワードのハッシュ化
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def verify_password(plain_password, hashed_password):
+    """平文パスワードとハッシュ化パスワードを比較"""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    """平文からハッシュ化"""
+    return pwd_context.hash(password)
+
+# ユーザーテーブルに対する操作
+def get_user(db_session, user_id):
+    """ユーザー名でユーザー情報を取得"""
+    return db_session.query(User).filter(User.id == user_id).first()
+
+def create_user(db_session, username:str, password:str):
+    """ユーザーを作成"""
+    hashed_password = get_password_hash(password)
+    new_user = User(username=username, password_hash=hashed_password)
+    db_session.add(new_user)
+    db_session.commit()
+    return new_user
 
 def parse_pascal_voc_xml(xml_path):
     tree = ET.parse(xml_path)
@@ -172,15 +212,8 @@ def run_image_search_app():
     # --- 検索UI ---
     search_term = st.text_input("検索キーワードを入力してください:", key="faiss_search_term")
 
-    # --- インデックス構築 ---
-    st.subheader("検索インデックス管理")
-    if st.button("検索インデックスを再構築する"):
-        with st.spinner("画像データベースからインデックスを構築しています..."):
-            build_and_save_faiss_index()
-
-    st.markdown("---")
-
     # --- 検索実行と結果表示 ---
+    results = []
     if search_term:
         results = search_images_with_faiss(search_term)
 
@@ -190,17 +223,34 @@ def run_image_search_app():
             
         st.write(f"**{len(results)}** 件の画像が見つかりました。（類似度が高い順）")
 
+    else:
+        # 検索キーワードがない場合は全件表示
+        results = search_images_in_db(search_term=None)
+        if not results:
+            st.info("データベースに画像が登録されていません。")
+            return
+
+        st.write(f"全 **{len(results)}** 件の画像が表示されています。（登録が新しい順）")
+
         cols = st.columns(4)
         for i, img_obj in enumerate(results):
             with cols[i % 4]:
                 image_bytes = get_image_bytes_from_s3(img_obj.s3_key)
                 
                 if image_bytes:
-                    st.image(image_bytes, caption=f"類似度スコア: {i+1}", use_container_width=True)
+                    st.image(image_bytes, caption=f"類似度順位: {i+1}", use_container_width=True)
                     st.markdown(f"**{img_obj.filename}**")
                     st.caption(f"分類: {img_obj.label or '(未設定)'}")
                     anno_count = len(img_obj.annotations) if img_obj.annotations else 0
                     st.caption(f"物体数: {anno_count}")
+
+                    if anno_count > 0:
+                        st.caption("アノテーション: 済み ✅")
+                    else:
+                        st.caption("アノテーション: 未実施 ❌")
+
+                    if st.button("詳細・編集", key=f"edit_{img_obj.id}"):
+                        st.session_state.editing_image_id = img_obj.id
                 else:
                     st.warning(f"表示不可:\n{img_obj.filename}")
 
@@ -622,6 +672,12 @@ def convert_image_to_vector():
         with st.spinner("アノテーション読込、S3アップロード、DB保存を実行中..."):
             db = SessionLocal()
             try:
+                # 現在のユーザー情報を取得
+                current_user = db.query(User).filter(User.username == st.session_state['username']).first()
+                if not current_user:
+                    st.error("ユーザーが見つかりません。")
+                    return
+                
                 for filename, file_data in st.session_state.staged_files.items():
                     # (1) アノテーションXMLを読み込む
                     xml_path = os.path.join(open_labeling_pascal_voc_output_dir, f"{Path(filename).stem}.xml")
@@ -633,6 +689,14 @@ def convert_image_to_vector():
                     # 先にバイトデータを読み込んでから、それぞれに使用する
                     file_data.seek(0) # ポインタを最初に戻す
                     image_bytes = file_data.read()
+
+                    # ハッシュ値を計算し、重複を確認
+                    image_hash = hashlib.sha256(image_bytes).hexdigest()
+                    existing_image = db.query(Image).filter(Image.image_hash == image_hash).first()
+                    if existing_image:
+
+                        st.warning(f"画像 '{filename}' は、既に '{existing_image.filename}' として登録されています。このファイルの処理はスキップしました。")
+                        continue
                     
                     # (2) S3へアップロード
                     s3_key = f"images/{uuid.uuid4()}_{filename}"
@@ -659,6 +723,7 @@ def convert_image_to_vector():
                         image_obj.label = st.session_state.annotation_data[filename]["label"] or None
                         image_obj.annotations = st.session_state.annotation_data[filename]["annotations"]
                         image_obj.vector = image_vector # ベクトルを更新
+                        image_obj.image_hash = image_hash # ハッシュ値も更新
                     else: # 新規作成
                         image_obj = Image(
                             filename=filename,
@@ -667,12 +732,45 @@ def convert_image_to_vector():
                             height=pil_img.height,
                             label=st.session_state.annotation_data[filename]["label"] or None,
                             annotations=st.session_state.annotation_data[filename]["annotations"],
-                            vector=image_vector # ベクトルを追加
+                            vector=image_vector, # ベクトルを追加
+                            image_hash=image_hash # ハッシュ値を追加
                         )
                         db.add(image_obj)
-                
+                    
+                    # --- ログ記録処理を新規追加 ---
+                    # 新規作成されたimage_objにIDを割り振るため、一度flushする
+                    db.flush()
+
+                    # 1. この画像とユーザーに関する過去のログを一度削除 (編集時の重複カウントを防ぐため)
+                    db.query(AnnotationLog).filter(
+                        AnnotationLog.image_id == image_obj.id,
+                        AnnotationLog.user_id == current_user.id
+                    ).delete(synchronize_session=False)
+
+                    # 2. 新しいアノテーション情報をログとして記録
+                    annotations_to_log = st.session_state.annotation_data.get(filename, {}).get("annotations", [])
+                    if annotations_to_log:
+                        for single_annotation in annotations_to_log:
+                            new_log = AnnotationLog(
+                                user_id=current_user.id,
+                                image_id=image_obj.id,
+                                annotation=single_annotation
+                            )
+                            db.add(new_log)
+                    
+
                 db.commit()
                 st.success(f"{len(st.session_state.staged_files)}件の画像の処理が完了しました。")
+
+                # --- ▼▼▼ ここから自動化処理を追加 ▼▼▼ ---
+                try:
+                    with st.spinner("検索インデックスを更新しています..."):
+                        build_and_save_faiss_index()
+                    st.toast("検索インデックスの更新が完了しました。", icon="✅")
+                except Exception as e:
+                    st.warning(f"検索インデックスの自動更新中にエラーが発生しました: {e}")
+                # --- ▲▲▲ 追加ここまで ▲▲▲ ---
+
                 # 正常に終了したらセッションをクリア
                 st.session_state.staged_files.clear()
                 st.session_state.annotation_data.clear()
@@ -956,9 +1054,137 @@ def search_images_with_faiss(search_term, top_k=20):
     finally:
         db.close()
 
+def show_ranking_page():
+    """アノテーション数のランキングを表示するページ"""
+    st.title("🏆 月間アノテーションランキング")
+    st.info("今月、最も多くのアノテーション（バウンディングボックス）を作成したユーザーのランキングです。")
+
+    # --- 集計期間の選択 ---
+    # 今月の初日と最終日を計算
+    today = datetime.now()
+    first_day_of_month = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # 来月の初日を計算し、そこから1マイクロ秒引くことで今月の最終日時を正確に得る
+    next_month = first_day_of_month.replace(day=28) + timedelta(days=4) # 月末日を超えるように日数を足す
+    last_day_of_month = next_month - timedelta(days=next_month.day)
+    last_day_of_month = last_day_of_month.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    st.write(f"**集計期間:** {first_day_of_month.strftime('%Y/%m/%d')} 〜 {last_day_of_month.strftime('%Y/%m/%d')}")
+
+    # --- データベースから集計 ---
+    db = SessionLocal()
+    try:
+        # UserテーブルとAnnotationLogテーブルを結合し、
+        # 期間で絞り込み、ユーザーごとにアノテーション数をカウントする
+        ranking_data = db.query(
+            User.username,
+            func.count(AnnotationLog.id).label('annotation_count')
+        ).join(
+            AnnotationLog, User.id == AnnotationLog.user_id
+        ).filter(
+            AnnotationLog.created_at >= first_day_of_month,
+            AnnotationLog.created_at <= last_day_of_month
+        ).group_by(
+            User.username
+        ).order_by(
+            func.count(AnnotationLog.id).desc()
+        ).all()
+
+        if not ranking_data:
+            st.warning("今月のアノテーションデータはまだありません。")
+        else:
+            # Pandas DataFrameに変換して表示
+            df = pd.DataFrame(ranking_data, columns=['ユーザー名', 'アノテーション数'])
+            df.index = df.index + 1 # 順位を1から始める
+            st.dataframe(df, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"ランキングデータの取得中にエラーが発生しました: {e}")
+    finally:
+        db.close()
+
 def main():
     st.set_page_config(layout="wide")
     cleanup_old_session_dirs()
+
+    # --- ▼▼▼ 認証ロジック ▼▼▼ ---
+    if 'authenticated' not in st.session_state:
+        st.session_state['authenticated'] = False
+    if 'username' not in st.session_state:
+        st.session_state['username'] = ""
+
+    # --- 未ログイン時の表示 (UI改善版) ---
+    if not st.session_state['authenticated']:
+        st.title("KG画像アノテーションシステム")
+        
+        col1, col2, col3 = st.columns([1, 1.2, 1])
+
+        with col2:
+            with st.container(border=True):
+                # ロゴ表示
+                try:
+                    logo_path = "./KG-Motors-Logo.png"
+                    if os.path.exists(logo_path):
+                        st.image(logo_path, use_container_width=True)
+                except Exception:
+                    pass # ロゴがなくてもエラーにしない
+
+                st.subheader("ログイン")
+                
+                # --- ログインフォーム ---
+                with st.form("login_form"):
+                    username = st.text_input("ユーザー名", placeholder="Username")
+                    password = st.text_input("パスワード", type="password", placeholder="Password")
+                    submitted = st.form_submit_button("ログイン", use_container_width=True, type="primary")
+                    
+                    if submitted:
+                        db = SessionLocal()
+                        try:
+                            # ユーザー名でユーザーを検索 (バグ修正)
+                            user = db.query(User).filter(User.username == username).first()
+                            
+                            if user and verify_password(password, user.password_hash):
+                                st.session_state['authenticated'] = True
+                                st.session_state['username'] = user.username
+                                st.rerun()
+                            else:
+                                st.error("ユーザー名またはパスワードが間違っています。")
+                        finally:
+                            db.close()
+            
+            # --- 新規登録フォーム (Expander) ---
+            with st.expander("アカウントをお持ちでない場合はこちら"):
+                with st.form("signup_form", clear_on_submit=True):
+                    st.markdown("##### 新規アカウント登録")
+                    new_username = st.text_input("ユーザー名", key="new_user")
+                    new_password = st.text_input("パスワード (4文字以上)", type="password", key="new_pass")
+                    confirm_password = st.text_input("パスワード (確認)", type="password", key="confirm_pass")
+                    signup_submitted = st.form_submit_button("登録する", use_container_width=True)
+
+                    if signup_submitted:
+                        if not all([new_username, new_password, confirm_password]):
+                            st.error("すべての項目を入力してください。")
+                        elif new_password != confirm_password:
+                            st.error("パスワードが一致しません。")
+                        elif len(new_password) < 4:
+                            st.error("パスワードは4文字以上にしてください。")
+                        else:
+                            db = SessionLocal()
+                            try:
+                                # ユーザー名の重複をチェック
+                                user_by_name = db.query(User).filter(User.username == new_username).first()
+
+                                if user_by_name:
+                                    st.error("このユーザー名は既に使用されています。")
+                                else:
+                                    # ユーザーを作成
+                                    create_user(db, new_username, new_password)
+                                    st.success("ユーザー登録が完了しました。上記フォームよりログインしてください。")
+                            finally:
+                                db.close()
+
+        return # 未ログイン時はここで描画を終了
+
+    # --- ▼▼▼ ログイン後のメインアプリケーション ▼▼▼ ---
 
     if 'current_page' not in st.session_state:
         st.session_state.current_page = "画像を登録する"
@@ -970,48 +1196,57 @@ def main():
     if check_session_timeout():
         return
 
+    # --- サイドバー ---
     try:
         logo_path = "./KG-Motors-Logo.png"
         if os.path.exists(logo_path):
-            st.sidebar.image(logo_path, width=150) 
-        else:
-            st.sidebar.warning(f"ロゴファイルが見つかりません: {os.path.abspath(logo_path)}")
+            st.sidebar.image(logo_path, width=150)
     except Exception as e_logo:
         st.sidebar.error(f"ロゴ画像の読み込み/表示中にエラー: {e_logo}")
 
     st.sidebar.title("ナビゲーション")
-    
+    st.sidebar.info(f"ようこそ、**{st.session_state.username}** さん")
+
     page_option_register = "画像を登録する"
     page_option_search = "画像を検索する"
     page_option_dataset = "データセット作成"
+    page_option_ranking = "ランキング"
 
     if st.sidebar.button(page_option_register, key="nav_button_register", use_container_width=True):
         st.session_state.current_page = page_option_register
         st.session_state.last_activity_time = time.time()
         st.rerun()
-
     if st.sidebar.button(page_option_search, key="nav_button_search", use_container_width=True):
         st.session_state.current_page = page_option_search
         st.session_state.last_activity_time = time.time()
         st.rerun()
-
     if st.sidebar.button(page_option_dataset, key="nav_button_dataset", use_container_width=True):
         st.session_state.current_page = page_option_dataset
         st.session_state.last_activity_time = time.time()
         st.rerun()
-
-    if 'authenticated' not in st.session_state:
-        st.session_state['authenticated'] = True 
-
-    if st.session_state.current_page == page_option_register:
-        st.title("KG画像登録システム") 
-        convert_image_to_vector() 
+    if st.sidebar.button(page_option_ranking, key="nav_button_ranking", use_container_width=True):
+        st.session_state.current_page = page_option_ranking
+        st.session_state.last_activity_time = time.time()
+        st.rerun()
+        
+    st.sidebar.divider()
     
+    if st.sidebar.button("ログアウト", key="logout_button", use_container_width=True):
+        # セッション情報をクリアしてログアウト
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+
+    # --- メインコンテンツの表示 ---
+    if st.session_state.current_page == page_option_register:
+        st.title("KG画像登録システム")
+        convert_image_to_vector()
     elif st.session_state.current_page == page_option_search:
         run_image_search_app()
-
     elif st.session_state.current_page == page_option_dataset:
         create_dataset_page()
+    elif st.session_state.current_page == page_option_ranking:
+        show_ranking_page()
 
 if __name__ == "__main__":
     main()
